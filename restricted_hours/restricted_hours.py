@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 EXEMPT_ROLE_ID = 1407104983672950986
 
 ALLOWED_START_HOUR = 15   # 15:00
-ALLOWED_END_HOUR   = 18   # 18:00
+ALLOWED_END_HOUR   = 18   # 18:00 (dahil değil, yani 17:59'a kadar)
 
 TURKEY_TZ = timezone(timedelta(hours=3))
 
@@ -29,54 +29,50 @@ class RestrictedHours(commands.Cog):
         now = datetime.now(TURKEY_TZ)
         return ALLOWED_START_HOUR <= now.hour < ALLOWED_END_HOUR
 
-    def _user_has_exempt_role(self, member: discord.Member) -> bool:
+    def _user_has_exempt_role(self, member) -> bool:
         if member is None:
             return False
         return any(role.id == EXEMPT_ROLE_ID for role in member.roles)
 
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
+        # Guild member nesnesini al (rol kontrolü için)
         guild = self.bot.modmail_guild
-
         try:
             member = guild.get_member(creator.id) or await guild.fetch_member(creator.id)
-        except (discord.NotFound, discord.HTTPException):
+        except Exception:
             member = None
 
-        # Muaf role sahipse, serbest
+        # Muaf role sahipse → serbest
         if self._user_has_exempt_role(member):
             return
 
-        # Saat uygunsa, serbest
+        # Uygun saatteyse → serbest
         if self._is_within_allowed_hours():
             return
 
         # ── Kısıtlama devreye giriyor ──
 
-        # Kullanıcıya DM gönder
+        # 1) Kullanıcıya DM gönder
         try:
             await creator.send(MSG_OUTSIDE_HOURS)
-        except discord.Forbidden:
-            pass
-
-        # Thread kanalına da mesaj yaz (log için)
-        try:
-            await thread.channel.send(
-                f"🔒 **Otomatik kapatıldı:** Kullanıcı mesajı çalışma saatleri "
-                f"dışında ({ALLOWED_START_HOUR}:00–{ALLOWED_END_HOUR}:00) gönderdi."
-            )
         except Exception:
             pass
 
-        # Thread'i kapat
+        # 2) Thread'i kapat (Modmail'in kendi close metoduyla)
         try:
             await thread.close(
                 closer=self.bot.user,
                 silent=True,
-                delete_channel=False,
+                delete_channel=True,
+                message=f"Mesaj çalışma saatleri ({ALLOWED_START_HOUR}:00–{ALLOWED_END_HOUR}:00) dışında gönderildi.",
             )
         except Exception:
-            pass
+            # Fallback: kanalı direkt sil
+            try:
+                await thread.channel.delete()
+            except Exception:
+                pass
 
 
 async def setup(bot):
