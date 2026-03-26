@@ -34,16 +34,9 @@ class RestrictedHours(commands.Cog):
             return False
         return any(role.id == EXEMPT_ROLE_ID for role in member.roles)
 
-    def _welcome_embed(self) -> discord.Embed:
-        embed = discord.Embed(
-            title="Destek talebi oluşturuldu.",
-            description="Mesajın bize ulaştı. Admin ekibi en kısa sürede sizinle iletişime geçecek.",
-            color=discord.Color.green(),
-        )
-        return embed
-
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
+        # creator None gelebiliyor, thread.recipient kullan
         user = thread.recipient
         if user is None:
             return
@@ -54,28 +47,23 @@ class RestrictedHours(commands.Cog):
         except Exception:
             member = None
 
-        # Muaf role sahipse → welcome embed gönder, devam et
+        # Muaf role sahipse → serbest
         if self._user_has_exempt_role(member):
-            try:
-                await user.send(embed=self._welcome_embed())
-            except Exception:
-                pass
             return
 
-        # Uygun saatteyse → welcome embed gönder, devam et
+        # Uygun saatteyse → serbest
         if self._is_within_allowed_hours():
-            try:
-                await user.send(embed=self._welcome_embed())
-            except Exception:
-                pass
             return
 
         # ── Kısıtlama devreye giriyor ──
+
+        # 1) Kullanıcıya DM gönder
         try:
             await user.send(MSG_OUTSIDE_HOURS)
         except Exception:
             pass
 
+        # 2) Thread'i kapat
         try:
             await thread.close(
                 closer=self.bot.user,
@@ -84,6 +72,7 @@ class RestrictedHours(commands.Cog):
                 message=f"Mesaj çalışma saatleri ({ALLOWED_START_HOUR}:00–{ALLOWED_END_HOUR}:00) dışında gönderildi.",
             )
         except Exception:
+            # Fallback: kanalı direkt sil
             try:
                 await thread.channel.delete()
             except Exception:
