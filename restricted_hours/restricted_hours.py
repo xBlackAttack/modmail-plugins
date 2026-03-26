@@ -36,10 +36,14 @@ class RestrictedHours(commands.Cog):
 
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
-        # Guild member nesnesini al (rol kontrolü için)
+        # creator None gelebiliyor, thread.recipient kullan
+        user = thread.recipient
+        if user is None:
+            return
+
         guild = self.bot.modmail_guild
         try:
-            member = guild.get_member(creator.id) or await guild.fetch_member(creator.id)
+            member = guild.get_member(user.id) or await guild.fetch_member(user.id)
         except Exception:
             member = None
 
@@ -55,11 +59,11 @@ class RestrictedHours(commands.Cog):
 
         # 1) Kullanıcıya DM gönder
         try:
-            await creator.send(MSG_OUTSIDE_HOURS)
+            await user.send(MSG_OUTSIDE_HOURS)
         except Exception:
             pass
 
-        # 2) Thread'i kapat (Modmail'in kendi close metoduyla)
+        # 2) Thread'i kapat
         try:
             await thread.close(
                 closer=self.bot.user,
