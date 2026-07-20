@@ -103,9 +103,17 @@ class TicketStats(commands.Cog):
     async def kapatan(self, ctx, gun: int = None):
         """Kim kaç ticket kapatmış. Örnek: ?tstats kapatan 30"""
         query, donem = self._date_query(gun)
+        bot_id = str(self.bot.user.id)
 
         pipeline = [
-            {"$match": {**query, "open": False, "closer": {"$ne": None}}},
+            {
+                "$match": {
+                    **query,
+                    "open": False,
+                    "closer": {"$ne": None},
+                    "closer.id": {"$ne": bot_id},
+                }
+            },
             {
                 "$group": {
                     "_id": "$closer.id",
@@ -119,8 +127,13 @@ class TicketStats(commands.Cog):
 
         sonuc = await self.logs.aggregate(pipeline).to_list(length=20)
 
+        # Bot tarafından kapatılanlar (zaman aşımı / otomatik kapatma)
+        oto_kapatma = await self.logs.count_documents(
+            {**query, "open": False, "closer.id": bot_id}
+        )
+
         if not sonuc:
-            return await ctx.send("Bu dönemde kapatılan ticket bulunamadı.")
+            return await ctx.send("Bu dönemde yetkililer tarafından kapatılan ticket bulunamadı.")
 
         max_count = sonuc[0]["count"]
         toplam = sum(r["count"] for r in sonuc)
@@ -140,7 +153,10 @@ class TicketStats(commands.Cog):
             description="\n".join(satirlar),
             color=self.bot.main_color,
         )
-        embed.set_footer(text=f"Listelenen toplam kapatma: {toplam}")
+        embed.set_footer(
+            text=f"Listelenen toplam kapatma: {toplam} • "
+            f"Otomatik kapatma (bot): {oto_kapatma}"
+        )
         await ctx.send(embed=embed)
 
     # ---------- kim kaç ticket'a yanıt vermiş ----------
@@ -157,6 +173,7 @@ class TicketStats(commands.Cog):
             {
                 "$match": {
                     "messages.author.mod": True,
+                    "messages.author.id": {"$ne": str(self.bot.user.id)},
                     "messages.type": {"$in": MOD_MSG_TYPES},
                 }
             },
