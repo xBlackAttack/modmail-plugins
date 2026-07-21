@@ -55,7 +55,9 @@ logger = getLogger(__name__)
 # ---------------------------------------------------------------------------
 API_ANAHTARI = ""
 
-MODEL_VARSAYILAN = "gemini-2.5-flash"
+# "-latest" takma adları her zaman erişilebilir en yeni modele işaret eder;
+# sabit sürüm adları (gemini-2.5-flash gibi) zamanla yeni kullanıcılara kapatılıyor.
+MODEL_VARSAYILAN = "gemini-flash-latest"
 
 VARSAYILAN_AYAR = {
     "_id": "config",
@@ -272,6 +274,19 @@ class AIDestek(commands.Cog):
             doc = dict(VARSAYILAN_AYAR)
         for k, v in VARSAYILAN_AYAR.items():
             doc.setdefault(k, v)
+        # Eski kurulumdan kalan Gemini dışı veya kullanımdan kalkmış model kaydını düzelt
+        model = str(doc.get("model", ""))
+        if not model.startswith("gemini") or model.startswith(
+            ("gemini-1", "gemini-2.0", "gemini-2.5")
+        ):
+            logger.warning(
+                "Geçersiz model kaydı (%s) bulundu, %s olarak sıfırlandı.",
+                doc.get("model"), MODEL_VARSAYILAN,
+            )
+            doc["model"] = MODEL_VARSAYILAN
+            await self.db.update_one(
+                {"_id": "config"}, {"$set": {"model": MODEL_VARSAYILAN}}, upsert=True
+            )
         self.ayar = doc
 
     async def _kaydet(self, **alanlar):
@@ -758,6 +773,7 @@ class AIDestek(commands.Cog):
                 "`?ai sustur` — bu ticket'ta AI'yi sustur/aç\n"
                 "`?ai bildirimkanal [#kanal]` — acil bildirim kopya kanalı\n"
                 "`?ai kur` — google-genai paketini bot içinden kur\n"
+                "`?ai modeller` — erişebildiğiniz modelleri listele\n"
                 "`?ai model <model-id>` — kullanılan Gemini modeli\n"
                 "`?ai anahtar <key>` — Gemini API anahtarı (mesaj silinir)"
             ),
@@ -991,12 +1007,50 @@ class AIDestek(commands.Cog):
         await self._kaydet(bildirim_kanal_id=kanal.id)
         await ctx.send(f"✅ Acil bildirimler ayrıca {kanal.mention} kanalına gönderilecek.")
 
+    @ai.command(name="modeller")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_modeller(self, ctx):
+        """API anahtarınızın erişebildiği Gemini modellerini listeler."""
+        if self.client is None:
+            return await ctx.send(f"❌ API hazır değil: {self.client_hata}")
+        isimler = []
+        try:
+            async with ctx.typing():
+                pager = await self.client.aio.models.list()
+                async for m in pager:
+                    isim = (getattr(m, "name", "") or "").replace("models/", "")
+                    if not isim.startswith("gemini"):
+                        continue
+                    eylemler = getattr(m, "supported_actions", None)
+                    if eylemler and "generateContent" not in eylemler:
+                        continue
+                    isimler.append(isim)
+        except Exception as e:
+            return await ctx.send(f"❌ Model listesi alınamadı: `{type(e).__name__}: {e}`")
+        if not isimler:
+            return await ctx.send("Erişilebilir Gemini modeli bulunamadı.")
+        isimler.sort()
+        satirlar = "\n".join(f"`{i}`" for i in isimler[:40])
+        embed = discord.Embed(
+            title="📡 Anahtarınızın Erişebildiği Modeller",
+            description=satirlar[:4000],
+            color=self.bot.main_color,
+        )
+        embed.set_footer(text="Seçmek için: ?ai model <model-adı>")
+        await ctx.send(embed=embed)
+
     @ai.command(name="model")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def ai_model(self, ctx, model_id: str):
-        """Kullanılacak Gemini modelini ayarlar (ör. gemini-2.5-pro, gemini-2.5-flash)."""
+        """Kullanılacak Gemini modelini ayarlar (ör. gemini-flash-latest)."""
+        if not model_id.startswith("gemini"):
+            return await ctx.send(
+                "❌ Yalnızca Gemini modelleri kullanılabilir. Örnekler: "
+                "`gemini-flash-latest`, `gemini-pro-latest`, `gemini-flash-lite-latest`\n"
+                "Erişebildiğiniz modelleri görmek için: `?ai modeller`"
+            )
         await self._kaydet(model=model_id)
-        await ctx.send(f"✅ Model `{model_id}` olarak ayarlandı.")
+        await ctx.send(f"✅ Model `{model_id}` olarak ayarlandı. `?ai test deneme` ile doğrulayın.")
 
     @ai.command(name="kur")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
