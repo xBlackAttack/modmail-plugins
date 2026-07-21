@@ -67,6 +67,7 @@ VARSAYILAN_AYAR = {
     "otomatik_ogren": True,     # yetkili cevaplarından otomatik öğren
     "acil_bildirim": True,      # acil durum embed'i + rol etiketi
     "model": MODEL_VARSAYILAN,
+    "yedek_model": "gemini-flash-lite-latest",  # asıl model yoğunsa denenecek model
     "api_key": None,            # boşsa API_ANAHTARI veya GEMINI_API_KEY kullanılır
     "sessiz_kanallar": [],      # AI'nin susturulduğu ticket kanalları
     "bildirim_kanal_id": None,  # acil bildirimlerin kopyalanacağı kanal (opsiyonel)
@@ -422,19 +423,41 @@ class AIDestek(commands.Cog):
             "Şemadaki tüm zorunlu alanları doldur.\n"
             + json.dumps(sema, ensure_ascii=False)
         )
-        try:
-            resp = await self.client.aio.models.generate_content(
-                model=self.ayar.get("model", MODEL_VARSAYILAN),
-                contents=kullanici_icerik,
-                config={
-                    "system_instruction": sistem,
-                    "response_mime_type": "application/json",
-                    "max_output_tokens": max_tokens,
-                    "temperature": 0.2,
-                },
-            )
-        except Exception:
-            logger.error("Gemini API çağrısı başarısız oldu.", exc_info=True)
+        modeller = [self.ayar.get("model", MODEL_VARSAYILAN)]
+        yedek = self.ayar.get("yedek_model")
+        if yedek and yedek not in modeller:
+            modeller.append(yedek)
+
+        resp = None
+        for model in modeller:
+            try:
+                resp = await self.client.aio.models.generate_content(
+                    model=model,
+                    contents=kullanici_icerik,
+                    config={
+                        "system_instruction": sistem,
+                        "response_mime_type": "application/json",
+                        "max_output_tokens": max_tokens,
+                        "temperature": 0.2,
+                    },
+                )
+                break
+            except Exception as e:
+                metin = str(e)
+                gecici = any(
+                    x in metin
+                    for x in ("503", "UNAVAILABLE", "high demand", "overloaded",
+                              "429", "RESOURCE_EXHAUSTED", "quota")
+                )
+                if gecici and model != modeller[-1]:
+                    logger.warning(
+                        "Model %s şu an müsait değil, yedek model deneniyor. (%s)",
+                        model, metin[:200],
+                    )
+                    continue
+                logger.error("Gemini API çağrısı başarısız oldu (%s).", model, exc_info=True)
+                return None
+        if resp is None:
             return None
         try:
             return self._json_ayikla(resp.text)
@@ -775,6 +798,7 @@ class AIDestek(commands.Cog):
                 "`?ai kur` — google-genai paketini bot içinden kur\n"
                 "`?ai modeller` — erişebildiğiniz modelleri listele\n"
                 "`?ai model <model-id>` — kullanılan Gemini modeli\n"
+                "`?ai yedekmodel <model-id>` — asıl model yoğunken kullanılacak model\n"
                 "`?ai anahtar <key>` — Gemini API anahtarı (mesaj silinir)"
             ),
         )
@@ -1051,6 +1075,18 @@ class AIDestek(commands.Cog):
             )
         await self._kaydet(model=model_id)
         await ctx.send(f"✅ Model `{model_id}` olarak ayarlandı. `?ai test deneme` ile doğrulayın.")
+
+    @ai.command(name="yedekmodel")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_yedekmodel(self, ctx, model_id: str = None):
+        """Asıl model yoğun olduğunda kullanılacak yedek modeli ayarlar (boş: kapat)."""
+        if model_id is None:
+            await self._kaydet(yedek_model=None)
+            return await ctx.send("Yedek model kapatıldı.")
+        if not model_id.startswith("gemini"):
+            return await ctx.send("❌ Yalnızca Gemini modelleri kullanılabilir. Liste: `?ai modeller`")
+        await self._kaydet(yedek_model=model_id)
+        await ctx.send(f"✅ Yedek model `{model_id}` olarak ayarlandı.")
 
     @ai.command(name="kur")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
