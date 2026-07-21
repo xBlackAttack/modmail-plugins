@@ -3,7 +3,7 @@
 AI Destek — Modmail (modmail-dev/Modmail) için kendini geliştiren yapay zeka destek eklentisi.
 
 Özellikler:
-  * Ticket'a gelen kullanıcı mesajlarını Claude ile analiz eder.
+  * Ticket'a gelen kullanıcı mesajlarını Google Gemini ile analiz eder.
   * Bilgi bankasındaki (öğrenilmiş) kayıtlar veya Modmail snippet'leriyle eşleşen
     soruları ANINDA otomatik yanıtlar.
   * Yetkili bir soruya cevap verdiğinde soru-cevap çiftini bilgi bankasına
@@ -26,23 +26,24 @@ from core import checks
 from core.models import PermissionLevel, getLogger
 
 try:
-    from anthropic import AsyncAnthropic
+    from google import genai
 except ImportError:
-    AsyncAnthropic = None
+    genai = None
 
 logger = getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # API ANAHTARI (isteğe bağlı)
-# .env dosyasına erişiminiz yoksa Anthropic API anahtarınızı doğrudan aşağıya
-# tırnakların arasına yapıştırın. Örnek:
-#   API_ANAHTARI = "sk-ant-api03-xxxxxxxx"
+# .env dosyasına erişiminiz yoksa Google Gemini API anahtarınızı doğrudan
+# aşağıya tırnakların arasına yapıştırın. Anahtar https://aistudio.google.com
+# adresinden ücretsiz alınır. Örnek:
+#   API_ANAHTARI = "AIzaSyXxxxxxxxxxxxxxxxxxxx"
 # DİKKAT: Bu dosyayı anahtar yazılı hâldeyken GitHub'a veya başkasıyla
 # paylaşmayın — anahtarınız ele geçirilebilir.
 # ---------------------------------------------------------------------------
 API_ANAHTARI = ""
 
-MODEL_VARSAYILAN = "claude-opus-4-8"
+MODEL_VARSAYILAN = "gemini-2.5-flash"
 
 VARSAYILAN_AYAR = {
     "_id": "config",
@@ -52,13 +53,13 @@ VARSAYILAN_AYAR = {
     "otomatik_ogren": True,     # yetkili cevaplarından otomatik öğren
     "acil_bildirim": True,      # acil durum embed'i + rol etiketi
     "model": MODEL_VARSAYILAN,
-    "api_key": None,            # boşsa ANTHROPIC_API_KEY ortam değişkeni kullanılır
+    "api_key": None,            # boşsa API_ANAHTARI veya GEMINI_API_KEY kullanılır
     "sessiz_kanallar": [],      # AI'nin susturulduğu ticket kanalları
     "bildirim_kanal_id": None,  # acil bildirimlerin kopyalanacağı kanal (opsiyonel)
 }
 
 # ---------------------------------------------------------------------------
-# Claude'a verilecek talimatlar ve yapılandırılmış çıktı şemaları
+# Yapay zekaya verilecek talimatlar ve yapılandırılmış çıktı şemaları
 # ---------------------------------------------------------------------------
 
 TRIAJ_TALIMAT = """\
@@ -217,24 +218,29 @@ class AIDestek(commands.Cog):
         await self.db.update_one({"_id": "config"}, {"$set": alanlar}, upsert=True)
 
     def _client_olustur(self):
-        if AsyncAnthropic is None:
-            logger.error("anthropic paketi kurulu değil; AI Destek devre dışı.")
+        if genai is None:
+            logger.error("google-genai paketi kurulu değil; AI Destek devre dışı. (pip install google-genai)")
             self.client = None
             return
         import os
         anahtar = (
             self.ayar.get("api_key")
             or API_ANAHTARI.strip()
-            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
         )
         if not anahtar:
             logger.warning(
-                "API anahtarı bulunamadı. `?ai anahtar <key>` komutuyla ayarlayın "
+                "Gemini API anahtarı bulunamadı. `?ai anahtar <key>` komutuyla ayarlayın "
                 "veya aidestek.py dosyasının başındaki API_ANAHTARI değişkenine yazın."
             )
             self.client = None
             return
-        self.client = AsyncAnthropic(api_key=anahtar)
+        try:
+            self.client = genai.Client(api_key=anahtar)
+        except Exception:
+            logger.error("Gemini istemcisi oluşturulamadı.", exc_info=True)
+            self.client = None
 
     def _kilit(self, kanal_id):
         if kanal_id not in self.kilitler:
@@ -304,39 +310,55 @@ class AIDestek(commands.Cog):
             self.gecmis[kanal_id] = self.gecmis[kanal_id][-40:]
 
     # ------------------------------------------------------------------
-    # Claude çağrıları
+    # Gemini çağrıları
     # ------------------------------------------------------------------
 
-    async def _claude_json(self, talimat, ek_sistem, kullanici_icerik, sema, max_tokens=2048):
-        """Yapılandırılmış (JSON) çıktı ile tek Claude çağrısı yapar."""
+    @staticmethod
+    def _json_ayikla(metin):
+        """Model çıktısından JSON nesnesini güvenli biçimde çıkarır."""
+        metin = (metin or "").strip()
+        if metin.startswith("```"):
+            metin = metin.strip("`")
+            if metin.lower().startswith("json"):
+                metin = metin[4:]
+        ilk = metin.find("{")
+        son = metin.rfind("}")
+        if ilk == -1 or son == -1:
+            raise ValueError("Çıktıda JSON bulunamadı")
+        return json.loads(metin[ilk:son + 1])
+
+    async def _ai_json(self, talimat, ek_sistem, kullanici_icerik, sema, max_tokens=2048):
+        """Yapılandırılmış (JSON) çıktı ile tek Gemini çağrısı yapar."""
         if self.client is None:
             return None
-        system = [
-            {"type": "text", "text": talimat, "cache_control": {"type": "ephemeral"}},
-        ]
+        sistem = talimat
         if ek_sistem:
-            system.append(
-                {"type": "text", "text": ek_sistem, "cache_control": {"type": "ephemeral"}}
-            )
+            sistem += "\n\n" + ek_sistem
+        sistem += (
+            "\n\n## ÇIKTI FORMATI (ZORUNLU)\n"
+            "Yanıtını YALNIZCA aşağıdaki JSON şemasına birebir uyan geçerli bir JSON "
+            "nesnesi olarak ver. JSON dışında hiçbir açıklama, metin veya kod bloğu yazma. "
+            "Şemadaki tüm zorunlu alanları doldur.\n"
+            + json.dumps(sema, ensure_ascii=False)
+        )
         try:
-            resp = await self.client.messages.create(
+            resp = await self.client.aio.models.generate_content(
                 model=self.ayar.get("model", MODEL_VARSAYILAN),
-                max_tokens=max_tokens,
-                system=system,
-                output_config={"format": {"type": "json_schema", "schema": sema}},
-                messages=[{"role": "user", "content": kullanici_icerik}],
+                contents=kullanici_icerik,
+                config={
+                    "system_instruction": sistem,
+                    "response_mime_type": "application/json",
+                    "max_output_tokens": max_tokens,
+                    "temperature": 0.2,
+                },
             )
         except Exception:
-            logger.error("Claude API çağrısı başarısız oldu.", exc_info=True)
-            return None
-        if resp.stop_reason == "refusal":
-            logger.warning("Claude isteği reddetti (refusal).")
+            logger.error("Gemini API çağrısı başarısız oldu.", exc_info=True)
             return None
         try:
-            metin = next(b.text for b in resp.content if b.type == "text")
-            return json.loads(metin)
+            return self._json_ayikla(resp.text)
         except Exception:
-            logger.error("Claude çıktısı çözümlenemedi.", exc_info=True)
+            logger.error("Gemini çıktısı çözümlenemedi: %r", getattr(resp, "text", None), exc_info=True)
             return None
 
     async def _triaj(self, kanal_id, yeni_mesaj):
@@ -347,7 +369,7 @@ class AIDestek(commands.Cog):
             + "\n\n## Kullanıcının yeni mesajı\n"
             + str(yeni_mesaj)[:3000]
         )
-        sonuc = await self._claude_json(
+        sonuc = await self._ai_json(
             TRIAJ_TALIMAT, self._bilgi_bankasi_metni(bilgiler), icerik, TRIAJ_SEMA
         )
         return sonuc, bilgiler
@@ -541,7 +563,7 @@ class AIDestek(commands.Cog):
             + "\n\n## Yetkilinin cevabı\n" + cevap_icerik[:2000]
             + "\n\n## Mevcut bilgi bankası başlıkları (JSON)\n" + basliklar
         )
-        sonuc = await self._claude_json(OGRENME_TALIMAT, None, icerik, OGRENME_SEMA)
+        sonuc = await self._ai_json(OGRENME_TALIMAT, None, icerik, OGRENME_SEMA)
         # Soru artık cevaplandı — beklemeden çıkar
         self.bekleyen.pop(kanal.id, None)
         if not sonuc or not sonuc.get("ogrenilmeli"):
@@ -669,8 +691,8 @@ class AIDestek(commands.Cog):
                 "`?ai eskale` — bu ticket'ı elle yetkiliye aktar\n"
                 "`?ai sustur` — bu ticket'ta AI'yi sustur/aç\n"
                 "`?ai bildirimkanal [#kanal]` — acil bildirim kopya kanalı\n"
-                "`?ai model <model-id>` — kullanılan Claude modeli\n"
-                "`?ai anahtar <key>` — Anthropic API anahtarı (mesaj silinir)"
+                "`?ai model <model-id>` — kullanılan Gemini modeli\n"
+                "`?ai anahtar <key>` — Gemini API anahtarı (mesaj silinir)"
             ),
         )
         await ctx.send(embed=embed)
@@ -846,7 +868,7 @@ class AIDestek(commands.Cog):
             return await ctx.send("❌ API anahtarı ayarlı değil. `?ai anahtar <key>`")
         async with ctx.typing():
             icerik = "## Konuşma geçmişi\n" + self._gecmis_metni(ctx.channel.id)
-            sonuc = await self._claude_json(OZET_TALIMAT, None, icerik, OZET_SEMA, max_tokens=4096)
+            sonuc = await self._ai_json(OZET_TALIMAT, None, icerik, OZET_SEMA, max_tokens=4096)
         if sonuc is None:
             return await ctx.send("❌ Özet oluşturulamadı.")
         embed = discord.Embed(
@@ -873,7 +895,7 @@ class AIDestek(commands.Cog):
             return await ctx.send("❌ API anahtarı ayarlı değil. `?ai anahtar <key>`")
         async with ctx.typing():
             icerik = "## Konuşma geçmişi\n" + self._gecmis_metni(ctx.channel.id)
-            sonuc = await self._claude_json(OZET_TALIMAT, None, icerik, OZET_SEMA, max_tokens=4096)
+            sonuc = await self._ai_json(OZET_TALIMAT, None, icerik, OZET_SEMA, max_tokens=4096)
         esk = sonuc or {}
         await self._eskale_et(thread, esk, neden="Yetkili tarafından elle aktarıldı.")
 
@@ -904,14 +926,14 @@ class AIDestek(commands.Cog):
     @ai.command(name="model")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def ai_model(self, ctx, model_id: str):
-        """Kullanılacak Claude modelini ayarlar."""
+        """Kullanılacak Gemini modelini ayarlar (ör. gemini-2.5-pro, gemini-2.5-flash)."""
         await self._kaydet(model=model_id)
         await ctx.send(f"✅ Model `{model_id}` olarak ayarlandı.")
 
     @ai.command(name="anahtar")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def ai_anahtar(self, ctx, *, anahtar: str):
-        """Anthropic API anahtarını ayarlar. Güvenlik için mesajınız silinir."""
+        """Gemini API anahtarını ayarlar. Güvenlik için mesajınız silinir."""
         try:
             await ctx.message.delete()
         except Exception:
