@@ -16,14 +16,26 @@ Kurulum için README.md dosyasına bakın.
 
 import asyncio
 import copy
+import importlib
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import discord
 from discord.ext import commands
 
 from core import checks
 from core.models import PermissionLevel, getLogger
+
+# google-genai paketinin, terminal erişimi olmayan ortamlarda bot içinden
+# kurulacağı klasör (Modmail dizini altında kalıcıdır).
+LIB_DIZIN = str(Path.cwd() / "plugins" / "aidestek_libs")
+
+if os.path.isdir(LIB_DIZIN) and LIB_DIZIN not in sys.path:
+    sys.path.insert(0, LIB_DIZIN)
 
 try:
     from google import genai
@@ -187,6 +199,7 @@ class AIDestek(commands.Cog):
         self.db = bot.api.get_plugin_partition(self)
         self.ayar = dict(VARSAYILAN_AYAR)
         self.client = None
+        self.client_hata = None  # istemci oluşturulamadıysa okunur sebep
         # kanal_id -> [(rol, icerik), ...] son konuşma geçmişi
         self.gecmis = {}
         # kanal_id -> {"soru": str, "zaman": datetime} — AI'nin cevaplayamadığı bekleyen soru
@@ -202,7 +215,55 @@ class AIDestek(commands.Cog):
 
     async def cog_load(self):
         await self._config_yukle()
+        if genai is None:
+            await self._paket_kur()
         self._client_olustur()
+
+    # ------------------------------------------------------------------
+    # google-genai paketini bot içinden kurma (terminal gerektirmez)
+    # ------------------------------------------------------------------
+
+    def _pip_calistir(self):
+        os.makedirs(LIB_DIZIN, exist_ok=True)
+        return subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "--target", LIB_DIZIN, "google-genai"],
+            capture_output=True, text=True, timeout=600,
+        )
+
+    async def _paket_kur(self):
+        """google-genai kurulu değilse pip'i bot içinden çalıştırarak kurar."""
+        global genai
+        if genai is not None:
+            return True
+        logger.info("google-genai bulunamadı, otomatik kurulum deneniyor...")
+        try:
+            sonuc = await asyncio.get_event_loop().run_in_executor(None, self._pip_calistir)
+        except Exception as e:
+            self.client_hata = f"pip çalıştırılamadı: `{type(e).__name__}: {e}`"
+            logger.error("pip çalıştırılamadı.", exc_info=True)
+            return False
+        if sonuc.returncode != 0:
+            kuyruk = (sonuc.stderr or sonuc.stdout or "").strip()[-600:]
+            self.client_hata = f"google-genai kurulamadı. pip hatası:\n```{kuyruk}```"
+            logger.error("pip install başarısız: %s", kuyruk)
+            return False
+        if LIB_DIZIN not in sys.path:
+            sys.path.insert(0, LIB_DIZIN)
+        # yarım kalmış 'google' modül kayıtlarını temizle ve yeniden dene
+        for mod in [m for m in list(sys.modules) if m == "google" or m.startswith("google.")]:
+            del sys.modules[mod]
+        importlib.invalidate_caches()
+        try:
+            from google import genai as g
+        except ImportError as e:
+            self.client_hata = f"google-genai kuruldu ama içe aktarılamadı: `{e}`"
+            logger.error("google-genai içe aktarılamadı.", exc_info=True)
+            return False
+        genai = g
+        self.client_hata = None
+        logger.info("google-genai otomatik kuruldu: %s", LIB_DIZIN)
+        return True
 
     async def _config_yukle(self):
         doc = await self.db.find_one({"_id": "config"})
@@ -218,9 +279,15 @@ class AIDestek(commands.Cog):
         await self.db.update_one({"_id": "config"}, {"$set": alanlar}, upsert=True)
 
     def _client_olustur(self):
+        self.client = None
+        self.client_hata = None
         if genai is None:
-            logger.error("google-genai paketi kurulu değil; AI Destek devre dışı. (pip install google-genai)")
-            self.client = None
+            if not self.client_hata:
+                self.client_hata = (
+                    "`google-genai` paketi kurulu değil. Kurmayı denemek için "
+                    "`?ai kur` komutunu kullanın."
+                )
+            logger.error("google-genai paketi kurulu değil; AI Destek devre dışı.")
             return
         import os
         anahtar = (
@@ -230,17 +297,16 @@ class AIDestek(commands.Cog):
             or os.environ.get("GOOGLE_API_KEY")
         )
         if not anahtar:
-            logger.warning(
-                "Gemini API anahtarı bulunamadı. `?ai anahtar <key>` komutuyla ayarlayın "
-                "veya aidestek.py dosyasının başındaki API_ANAHTARI değişkenine yazın."
+            self.client_hata = (
+                "API anahtarı bulunamadı. `?ai anahtar <key>` komutuyla ayarlayın."
             )
-            self.client = None
+            logger.warning("Gemini API anahtarı bulunamadı.")
             return
         try:
             self.client = genai.Client(api_key=anahtar)
-        except Exception:
+        except Exception as e:
+            self.client_hata = f"İstemci hatası: `{type(e).__name__}: {e}`"
             logger.error("Gemini istemcisi oluşturulamadı.", exc_info=True)
-            self.client = None
 
     def _kilit(self, kanal_id):
         if kanal_id not in self.kilitler:
@@ -691,6 +757,7 @@ class AIDestek(commands.Cog):
                 "`?ai eskale` — bu ticket'ı elle yetkiliye aktar\n"
                 "`?ai sustur` — bu ticket'ta AI'yi sustur/aç\n"
                 "`?ai bildirimkanal [#kanal]` — acil bildirim kopya kanalı\n"
+                "`?ai kur` — google-genai paketini bot içinden kur\n"
                 "`?ai model <model-id>` — kullanılan Gemini modeli\n"
                 "`?ai anahtar <key>` — Gemini API anahtarı (mesaj silinir)"
             ),
@@ -705,7 +772,8 @@ class AIDestek(commands.Cog):
         bilgi_sayisi = await self.db.count_documents({"tur": "bilgi"})
         roller = ", ".join(f"<@&{r}>" for r in self.ayar.get("rol_idler", [])) or "—"
         embed = discord.Embed(title="🤖 AI Destek — Durum", color=self.bot.main_color)
-        embed.add_field(name="API", value="✅ hazır" if self.client else "❌ anahtar yok", inline=True)
+        api_durum = "✅ hazır" if self.client else f"❌ {self.client_hata or 'hazır değil'}"
+        embed.add_field(name="API", value=api_durum[:1024], inline=True)
         embed.add_field(name="Model", value=f"`{self.ayar.get('model')}`", inline=True)
         embed.add_field(name="Güven Eşiği", value=f"{self.ayar.get('guven_esigi')}", inline=True)
         embed.add_field(name="Otomatik Cevap", value="✅" if self.ayar.get("otomatik_cevap") else "❌", inline=True)
@@ -930,6 +998,31 @@ class AIDestek(commands.Cog):
         await self._kaydet(model=model_id)
         await ctx.send(f"✅ Model `{model_id}` olarak ayarlandı.")
 
+    @ai.command(name="kur")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_kur(self, ctx):
+        """google-genai paketini bot içinden kurmayı dener (terminal gerektirmez)."""
+        if genai is not None:
+            self._client_olustur()
+            if self.client:
+                return await ctx.send("✅ Paket zaten kurulu ve API hazır.")
+            return await ctx.send(
+                f"✅ Paket kurulu ama istemci hazır değil.\n**Sebep:** {self.client_hata}"
+            )
+        mesaj = await ctx.send("⏳ `google-genai` kuruluyor, bu 1-2 dakika sürebilir...")
+        basarili = await self._paket_kur()
+        if not basarili:
+            return await mesaj.edit(
+                content=f"❌ Kurulum başarısız.\n**Sebep:** {self.client_hata}"
+            )
+        self._client_olustur()
+        if self.client:
+            await mesaj.edit(content="✅ `google-genai` kuruldu ve API hazır! `?ai durum` ile kontrol edebilirsiniz.")
+        else:
+            await mesaj.edit(
+                content=f"✅ Paket kuruldu ama istemci hazır değil.\n**Sebep:** {self.client_hata}"
+            )
+
     @ai.command(name="anahtar")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def ai_anahtar(self, ctx, *, anahtar: str):
@@ -940,7 +1033,10 @@ class AIDestek(commands.Cog):
             pass
         await self._kaydet(api_key=anahtar.strip())
         self._client_olustur()
-        durum = "✅ API anahtarı kaydedildi ve bağlantı hazır." if self.client else "⚠️ Anahtar kaydedildi ama istemci oluşturulamadı (loglara bakın)."
+        if self.client:
+            durum = "✅ API anahtarı kaydedildi ve bağlantı hazır."
+        else:
+            durum = f"⚠️ Anahtar kaydedildi ama istemci oluşturulamadı.\n**Sebep:** {self.client_hata}"
         await ctx.send(durum)
 
 
